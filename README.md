@@ -1,369 +1,280 @@
-# OrcaPlayground
+# 松应仿真训练营 · 第二篇：从场景资产搭建到 G1 定点导航
 
-OrcaGym 示例代码仓库，已集成 OrcaLab 支持。
+从绿色桌子绕障，到工厂电气柜巡检：用两个循序渐进的 Demo，串起 **场景搭建、相机取流、定点导航、机器人行走与到点拍照**。
 
-当前版本：26.7.1 | 版本分支：release/26.7.1
+本篇复用已有的 G1 ONNX 运控模型，将仿真实时位姿、预设路径点和 RGB 颜色规则组合成导航任务。你将先在简单场景中跑通绕桌闭环，再在工厂场景中完成多路径点的导航到指定位置。
 
-📌 强烈建议配合OrcaLab26.7.1使用！！！
+![工厂巡检全景与 G1 头部相机画面](docs/stage2/images/factory-overview.png)
 
-📌 版本发布说明 本项目采用版本分支策略进行版本管理：
+## 资料导航
 
-正式版本发布后，会将 main 分支的代码合入对应的版本分支（如 release/26.7.1） 版本分支命名格式：release/<主版本>.<次版本>.<修订号> 每个正式版本对应一个版本分支，用于版本追踪和热修复 开发阶段请使用 main 或 dev 分支，正式发布后合入版本分支
+| 资料 | 入口 |
+| --- | --- |
+| 第二篇完整技术文档 | [飞书：从场景资产搭建到 G1 定点导航](https://wcnlc0kde55u.feishu.cn/wiki/AnIAwm8ogio7sKkDFQZc1b9Cnef) |
+| 第一篇入门教程 | [环境安装、资产与官方示例](https://github.com/Xbotics-Embodied-AI-club/Orcaplayground-G1-routing-inspection/blob/release/26.7.1/docs/tutorial.md) |
+| Demo 视频 | [绿色桌子绕障](https://wcnlc0kde55u.feishu.cn/wiki/AnIAwm8ogio7sKkDFQZc1b9Cnef#BZtldaMmwo6pnFxQHhbcHvdpnug) · [工厂电气柜巡检](https://wcnlc0kde55u.feishu.cn/wiki/AnIAwm8ogio7sKkDFQZc1b9Cnef#PW9Rdag28oSvskxsIqtc4eMbnZg) |
+| 场景布局文件 | [green_table.json](docs/stage2/layouts/green_table.json) · [factory_navi.json](docs/stage2/layouts/factory_navi.json) |
+| 本文操作入口 | [运行准备](#运行准备) · [场景与相机](#场景与相机) · [绕桌前进](#demo-1绿色桌子绕障) · [工厂巡检](#demo-2工厂电气柜巡检) · [FAQ](#常见问题) |
+| 官方项目说明 | [OrcaPlayground 官方 README（26.7.1）](https://github.com/openverse-orca/OrcaPlayground/blob/release/26.7.1/README.md) |
 
-## 🎯 快速开始
+视频保留在飞书原文的“仿真视频”章节中；如章节定位未生效，可打开完整文档后定位第四、五章。
 
-### 方式 1：使用 OrcaLab 启动（推荐）⭐
+## 两个 Demo 与分支
 
-本项目已配置 OrcaLab 集成，可以直接在 OrcaLab 中启动示例。
+| Demo | 任务 | 分支 | 入口脚本 |
+| --- | --- | --- | --- |
+| 绿色桌子绕障 | 从桌子南侧出发，识别绿色桌面、绕行并到达北侧目标点 | [feature/demo1-v1-green-table](https://github.com/Xbotics-Embodied-AI-club/Orcaplayground-G1-routing-inspection/tree/feature/demo1-v1-green-table) | `examples/euler/g1_vision_nav/run_green_table_crossing.py` |
+| 工厂电气柜巡检 | 沿预设路径点前进，结合 RGB 修正运动，到柜前取景拍照 | [demo1-v1-factory-navi](https://github.com/Xbotics-Embodied-AI-club/Orcaplayground-G1-routing-inspection/tree/demo1-v1-factory-navi) | `examples/euler/g1_vision_nav/run_factory_navi.py` |
 
-#### 步骤 1：安装 OrcaLab
+两个分支共用这份说明，但各自包含不同的任务入口。运行前先切换到对应分支；不需要把两个分支合并，也不需要下载两份仓库。
+
+## 技术路线
+
+上层导航根据机器人位姿和目标点计算运动方向，再利用相机 RGB 中的颜色信息调整速度与转向。底层 ONNX 模型把速度指令转换为 G1 的 29 个本体关节目标，由执行器适配层驱动场景中的 `g1_pick_usda`。
+
+| 层次 | 输入与职责 |
+| --- | --- |
+| 场景 | OrcaLab 加载 Layout，提供机器人、桌子、货架和电气柜 |
+| 感知与状态 | 通过 gRPC 读取实时位姿，通过 RGB 视频流获取头部相机画面 |
+| 导航 | 目标点跟随、路径点切换、基于颜色规则的近场避障 |
+| 运控 | 复用已训练的 ONNX 模型，执行前进、侧移与转向指令 |
+| 任务结果 | 绕过桌子到达目标，或抵达柜前并保存照片 |
+
+<details>
+<summary>展开查看分层架构图</summary>
+
+![G1 视觉导航系统架构](docs/stage2/images/navigation-architecture.png)
+
+图中“偏转角”对应的实际控制量是转向角速度 `yaw_rate`。导航层输出速度指令，底层运控模型负责关节动作。
+
+</details>
+
+本案例面向仿真开发入门：位置来自仿真平台，路径点由人工设定，避障和柜前拍照采用颜色规则。它不包含 SLAM、通用目标识别或设备故障诊断；“到点拍照”是模拟巡检流程的一环。
+
+## 运行准备
+
+### 1. 获取课程代码
 
 ```bash
-pip install orca-lab
+mkdir -p ~/SY
+cd ~/SY
+git clone --branch feature/demo1-v1-green-table \
+  https://github.com/Xbotics-Embodied-AI-club/Orcaplayground-G1-routing-inspection.git OrcaPlayground
+cd OrcaPlayground
 ```
 
-#### 步骤 2：激活 orca conda 环境并安装基础依赖
+这里将本地目录命名为 `OrcaPlayground`，以便与后续命令一致。已有本仓库的用户无需重新克隆。
+
+### 2. 准备开发环境
+
+课程使用 **Ubuntu / Linux、Python 3.12、OrcaLab 26.7.1 和 OrcaGym 26.7.1**。先按[第一篇教程](https://github.com/Xbotics-Embodied-AI-club/Orcaplayground-G1-routing-inspection/blob/release/26.7.1/docs/tutorial.md)完成 OrcaLab 安装。
+
+将图形界面和任务程序分别放在两个 Conda 环境中：`orcalab` 启动图形界面，`orca` 运行 Demo的任务程序。若已配置 `orca`，直接激活；否则从已安装 OrcaLab 的环境复制：
 
 ```bash
-# 激活 orca 环境（本项目推荐的环境名称）
+conda create --name orca --clone orcalab
 conda activate orca
 
-# 进入项目目录
-cd /path/to/OrcaPlayground
+cd ~/SY/OrcaPlayground
+python -m pip install -r requirements.txt
+python -m pip install onnxruntime opencv-python Pillow av websockets
 
-# 安装基础依赖
-pip install -r requirements.txt
+python -m pip show orca-gym
+python -c "import sys; print(sys.executable)"
 ```
 
-如果你要运行重依赖样例，再额外安装对应目录下的依赖：
+确认 OrcaGym 版本及 Python 路径，运行脚本时使用 `orca` 环境。此处复用已有运控模型，不需要安装完整强化学习训练环境，也不要求单独克隆 OrcaGym 源码。
 
-```bash
-# 例如：legged_gym
-pip install -r examples/legged_gym/requirements.txt
+### 3. 准备 Layout 文件
 
-# 或使用 setuptools extras（适合源码开发）
-pip install -e ".[legged_gym]"
-```
+仓库内路径如下：
 
-#### 步骤 3：在当前目录启动 OrcaLab
-
-```bash
-# 在项目根目录启动 OrcaLab（会自动加载 .orcalab/config.toml）
-orcalab .
-
-# 或者直接启动（默认使用当前目录作为工作目录）
-orcalab
-```
-
-OrcaLab 会自动加载工作目录下的 `.orcalab/config.toml` 配置文件。
-
-#### 步骤 4：在 OrcaLab 中启动示例
-
-1. 在 OrcaLab 界面中选择 **外部程序**（External Programs）
-2. 从列表中选择对应的示例程序（完整列表见 [.orcalab/config.toml](.orcalab/config.toml)）：
-   - `Empty Loop Simulation` - 空循环仿真
-   - `run_character` - 角色仿真
-   - `run_legged_rl_train` - 足式机器人 RL 训练（SB3 PPO）
-   - `run_legged_rllib_train` - 足式机器人 RL 训练（RLlib APPO）
-   - `run_wheeled_chassis` - 轮式底盘仿真（差速驱动）
-   - `run_ackerman` - 阿克曼转向底盘仿真
-   - `run_xbot_orca` - XBot 双足机器人仿真
-   - `run_g1` - G1 人形机器人仿真
-   - `zq_sa01` - ZQ SA01 人形仿真
-   - `run_actors` - Actor 场景复制示例
-   - `run_lights` - 灯光场景复制示例
-   - `Franka Reach Training` - Franka 多机械臂 Reach 任务训练（TQC + HER）
-   - `run_fluid_sim` - 流体仿真
-
-配置文件位置：`.orcalab/config.toml`
-
- **终端输出提醒**
->
-> 当前仓库启动、扫描、报错和退出信息都会输出到**终端**。
->
-> 如果程序没有按预期运行，请优先点击界面左下角的**终端按钮**查看输出日志和报错信息。
-
-### 方式 2：命令行启动
-
-
-
-```bash
-# 安装基础依赖
-pip install -r requirements.txt
-
-# 按需安装额外依赖（示例）
-pip install -r examples/legged_gym/requirements.txt
-
-# 或使用 setuptools extras（示例）
-pip install -e ".[legged_gym]"
-
-# 运行示例（参考各示例目录下的 README.md）
-python examples/character/run_character.py
-python examples/xbot/run_xbot_orca.py
-python examples/legged_gym/run_legged_rl.py --config examples/legged_gym/configs/sb3_ppo_config.yaml --train
-python examples/fluid/run_fluid_sim.py
-```
-
-## 📦 项目结构
-
-```
+```text
 OrcaPlayground/
-├── envs/                  # 环境定义模块（参考实现，详见 envs/README.md）
-│   ├── legged_gym/        #   足式机器人（SB3 / RLlib 训练 + 交互仿真）
-│   ├── franka_rl/         #   Franka 多机械臂（SB3 + HER 训练）
-│   ├── manipulation/      #   单/双臂操作环境
-│   ├── drone/             #   无人机推力环境
-│   ├── fluid/             #   SPH 流体耦合仿真
-│   ├── character/         #   人形角色动画
-│   ├── wheeled_chassis/   #   差速 / 阿克曼底盘
-│   ├── g1/  zq_sa01/  xbot_gym/  # 人形 / 四足机器人环境
-│   └── common/            #   场景模型扫描等公共工具
-├── examples/              # 示例代码目录
-│   ├── character/         # 角色仿真（含 README.md）
-│   ├── legged_gym/        # 足式机器人 RL 训练 + 交互仿真（含 README.md）
-│   ├── wheeled_chassis/   # 轮式底盘：差速 + 阿克曼（含 README.md）
-│   ├── xbot/              # XBot 双足机器人（含 README.md）
-│   ├── d12/               # D12 双臂机器人（demo 脚本轨迹 + act ACT 策略，含 README.md）
-│   ├── franka_rl/         # Franka 多机械臂 RL（SB3 + HER，含 README.md）
-│   ├── ant_rl/            # Ant 机器人 RL（Ray RLlib APPO 多环境并行，含 README.md）
-│   ├── drone_driver/      # 无人机推力驱动仿真（含 README.md）
-│   ├── zq_sa01/           # ZQ SA01 人形（含 README.md）
-│   ├── g1/                # G1 人形（含 README.md）
-│   ├── orca_locomotion/   # OrcaLocomotion：Go2 / G1 策略回放（含 README.md）
-│   ├── replicator/        # 场景复制：Actor / Light（含 README.md）
-│   └── fluid/             # 流体仿真（含 README.md）
-├── .orcalab/              # OrcaLab 配置文件
-│   └── config.toml        # 外部程序配置
-└── requirements.txt       # Python 基础依赖
+└── docs/stage2/layouts/
+    ├── green_table.json
+    └── factory_navi.json
 ```
 
-## 📚 示例说明
+可直接在 OrcaLab 中打开这里的文件，并按下方命令传入 `--layout`。该参数**仅打印场景路径提示，不会替你加载布局**；当前实际场景由 OrcaLab 界面中打开的 Layout 决定，详细解释可以参考文档内置的教学视频。
 
-所有示例的详细使用说明请查看各目录下的 `README.md`：
 
-- **角色仿真** - [`examples/character/README.md`](examples/character/README.md)：Remy 角色键盘 / 路径点控制
-- **足式机器人 RL 训练** - [`examples/legged_gym/README.md`](examples/legged_gym/README.md)：SB3 PPO + RLlib APPO，支持 Lite3 / Go2 / G1 等
-- **轮式底盘** - [`examples/wheeled_chassis/README.md`](examples/wheeled_chassis/README.md)：差速驱动 + 阿克曼转向
-- **XBot 机器人** - [`examples/xbot/README.md`](examples/xbot/README.md)：基于 humanoid-gym 预训练模型的双足行走
-- **D12 双臂机器人** - [`examples/d12/README.md`](examples/d12/README.md)：脚本轨迹回放（[demo](examples/d12/demo/README.md)）+ ACT 策略推理（[act](examples/d12/act/README.md)）
-- **Franka 多机械臂 RL** - [`examples/franka_rl/README.md`](examples/franka_rl/README.md)：SB3 + HER，多臂并行训练 + 局部坐标隔离
-- **Ant RL** - [`examples/ant_rl/README.md`](examples/ant_rl/README.md)：Ray RLlib APPO 多环境并行训练（单机 / 集群）
-- **无人机推力驱动仿真** - [`examples/drone_driver/README.md`](examples/drone_driver/README.md)：CTBR 控制器 + 多机型 profile，键盘 / 手柄操控
-- **ZQ SA01 人形** - [`examples/zq_sa01/README.md`](examples/zq_sa01/README.md)：Isaac Gym PPO 模型移植
-- **G1 人形** - [`examples/g1/README.md`](examples/g1/README.md)：ASAP 策略移植，自由行走 + 键盘控制 + Mimic 动作
-- **OrcaLocomotion** - [`examples/orca_locomotion/README.md`](examples/orca_locomotion/README.md)：PyPI 包回放 Go2 / G1 运动控制策略
-- **场景复制** - [`examples/replicator/README.md`](examples/replicator/README.md)：Actor 与 Light 批量生成
-- **流体仿真** - [`examples/fluid/README.md`](examples/fluid/README.md)：SPH 流体与 MuJoCo 刚体耦合
+## 场景与相机
 
-> **⚠️ 重要提示：资产准备**
-> 
-> 每个示例都需要相应的 3D 资产才能正常运行。**请务必查看各示例目录下的 README.md 文件**，了解：
-> - 📦 所需资产的下载地址
-> - 🔧 需要手动在 OrcaStudio/OrcaLab 中把对应 actor 拖动到布局
-> - 📝 对应的模型名称
-> 
-> 资产下载地址：https://simassets.orca3d.cn/
+<a id="-手动拖动资产运行前必做"></a>
 
-## 📦 关于资产与扩展开发
+### 1. 订阅并同步资产
 
-OrcaPlayground 依赖 **OrcaPlaygroundAssets** 资产库中的资源。若您需要接入新模型或进行其他扩展开发，请参阅 **OrcaLab** 及资产库的文档与资源。
+在 [ORCA 资产中心](https://simassets.orca3d.cn/?lang=zh)订阅飞书教程使用的资产包，并等待 OrcaLab 同步完成。Layout 只描述布局，不能代替对应的资产文件。
 
-## 🔧 手动拖动资产（运行前必做）
+| 资产包 | 教程中的用途 |
+| --- | --- |
+| `g1_pick` | 本次使用的 G1 机器人 |
+| `AutoProductionLine_Warehouse` | 工作台、周转箱等仓储资产 |
+| `Industry_DataCenter_Plugging_01` | 办公桌、电气柜等资产 |
+| `Industry_Workshop_Inspection_01` | 工业电气控制柜等资产 |
+| `OfficeSupplies` | 绿色办公桌、货柜等资产 |
+| `SimpleMovement_Conveybelt` | 传送带场景、金属桶与纸箱 |
+| `SimpleMovement_Screw` | 螺丝刀、储物箱等资产 |
+| `OrcaPlaygroundAssets` | 官方示例配套资产 |
+| `PlayGroundScene` | 示例场景与机器人资产 |
+| `unitree_robots` | 宇树机器人资产 |
+| `unitree_g1_southgrid1` | 南方电网赛事配套资产 |
 
-为了增添多场景物理交互，请在运行前先把对应模型手动拖动到布局中，再启动脚本。当前仓库中的机器人/角色主线示例都按“场景中已有 actor，脚本只做扫描和绑定”的思路组织。
+<details>
+<summary>查看教程中的资产订阅截图</summary>
 
-1. **打开资产面板**：在 OrcaStudio/OrcaLab 的资产窗口中搜索资产名称，例如Lite3,Remy，Hummer。
-2. **拖入布局**：将对应 actor 拖入布局或大纲，并调整到你希望的初始位置与朝向。
-3. **查看资产详情**：选中该资产后打开“资产详情”，确认路径与示例 README 中给出的路径一致。
-4. **再启动脚本**：脚本会扫描场景中的 joint / actuator / body 等后缀并自动绑定；如果拖错模型或匹配不完整，会直接报错退出。
-5. **路径不一致时的处理**：若你的资产包版本不同，请以 UI 里的“资产详情”实际路径为准，但 actor 类型必须与示例要求一致。
-6. **观察程序输出**：请点击左下角**终端按钮**查看启动日志、扫描结果和错误原因。
+![飞书教程中的资产包订阅列表](docs/stage2/images/asset-subscriptions.png)
 
-各示例的具体拖入说明见对应 README：
-- 足式机器人：[examples/legged_gym/README.md](examples/legged_gym/README.md#-手动拖入资产进行调试)
-- 轮式底盘：[examples/wheeled_chassis/README.md](examples/wheeled_chassis/README.md#-手动拖入资产进行调试)
-- XBot：[examples/xbot/README.md](examples/xbot/README.md#-手动拖入资产进行调试)
-- Franka 多机械臂：[examples/franka_rl/README.md](examples/franka_rl/README.md#-手动拖入资产进行调试)
-- 无人机：[examples/drone_driver/README.md](examples/drone_driver/README.md#-手动拖入资产进行调试)
-- ZQ SA01：[examples/zq_sa01/README.md](examples/zq_sa01/README.md#-手动拖入资产进行调试)
-- G1：[examples/g1/README.md](examples/g1/README.md#-手动拖入资产进行调试)
+</details>
 
-## 📋 依赖说明
+### 2. 打开对应场景
 
-### 基础依赖（必需）
-
-先按 [快速开始](#-快速开始) 安装 `orca-lab`（OrcaLab / OrcaGym 基础运行时），再安装本仓库基础依赖：
+终端 A 启动界面：
 
 ```bash
-pip install -r requirements.txt
+conda activate orcalab
+cd ~/SY/OrcaPlayground
+orcalab .
 ```
 
-`requirements.txt` 只保留大多数示例都会用到的最小运行时：
-- `pyyaml>=6.0` - 通用 YAML 配置解析
-- `pygame` - 键盘 / 手柄输入
-- `numba` - 数值计算加速
+| Demo | 初始场景 | 加载步骤 |
+| --- | --- | --- |
+| 绿色桌子 | `Carring` | 加载默认布局后，通过“文件 → 打开布局”选择 `docs/stage2/layouts/green_table.json` |
+| 工厂巡检 | `SimpleMovement_Conveybelt` | 加载默认布局后，通过“文件 → 打开布局”选择 `docs/stage2/layouts/factory_navi.json` |
 
-### 示例额外依赖（按需安装）
+<details>
+<summary>查看场景选择与 Layout 效果</summary>
 
-安装基础依赖后，再根据你要运行的示例追加安装：
+**绿色桌子**
 
-简单示例 `character`、`wheeled_chassis`、`replicator`、`drone_driver` 安装根目录 `requirements.txt` 即可。`orca_locomotion` 需额外通过 PyPI 安装 `orca-locomotion` 包（详见其 README）。
+![选择 Carring 场景](docs/stage2/images/select-carring.png)
 
-如果你是以源码方式开发，也可以直接用 `extras_require`（`setup.py` 会自动发现各示例目录下的 `requirements.txt` 作为 extras）：
+![绿色桌子 Layout](docs/stage2/images/green-table-layout.png)
+
+**工厂巡检**
+
+![选择 SimpleMovement_Conveybelt 场景](docs/stage2/images/select-factory-scene.png)
+
+![工厂巡检 Layout](docs/stage2/images/factory-layout.png)
+
+</details>
+
+确认场景中已有 `g1` Actor，使用 `g1_pick_usda` 资产。本篇直接控制 Layout 中的机器人，无需额外添加第二台；这与第一篇使用的 G1 资产不同。
+
+### 3. 开启头部 RGB 相机
+
+展开大纲中的 **g1 → mujoco_wrap**，打开“递归显示”，在属性面板中找到头部相机：
+
+- 勾选 `ColorCamera`、`Enable`、`UseNvEnc` 和 `IsRecording`。
+- 确认 `ColorPort` 为 `7070`，不要让其他相机占用同一端口。
+- 本篇使用 RGB，脚本不依赖深度流。
+
+![G1 头部相机开关与 ColorPort 配置](docs/stage2/images/camera-settings.png)
+
+### 4. 进入手动启动模式
+
+点击右上角三角形启动图标，选择 **“无仿真程序（手动启动）”**，点击启动，确认界面进入 Runtime。
+
+![选择无仿真程序手动启动](docs/stage2/images/manual-launch.png)
+
+保持终端 A 和 OrcaLab 窗口运行，在终端 B 启动下方的任务脚本。不要同时运行 Empty Loop Simulation 或另一份控制程序。
+
+| 通道 | 默认端口 | 作用 |
+| --- | --- | --- |
+| gRPC | `50051` | 仿真状态与控制 |
+| RGB 视频流 | `7070` | 头部相机彩色图像 |
+| 工厂网页预览 | `8765` | 可选的第一视角展示，不是相机取流端口 |
+
+## Demo 1：绿色桌子绕障
+
+**目标：**G1 从绿色桌子南侧出发，利用实时位姿朝北侧目标点前进，并根据 RGB 颜色信息绕过桌子。
+
+在终端 B 中执行：
 
 ```bash
-# 基础可编辑安装
-pip install -e .
+cd ~/SY/OrcaPlayground
+conda activate orca
+git switch feature/demo1-v1-green-table
 
-# 安装单个样例的额外依赖
-pip install -e ".[franka_rl]"    # SB3 + HER 强化学习（Franka Panda）
-pip install -e ".[ant_rl]"       # Ray RLlib APPO 强化学习（Ant）
-pip install -e ".[legged_gym]"   # SB3 + RLlib 足式机器人训练
-pip install -e ".[g1]"           # G1 人形机器人
-pip install -e ".[xbot]"         # XBot 机器人
-pip install -e ".[zq_sa01]"      # ZQ-SA01 人形机器人
-pip install -e ".[d12]"          # D12 双臂机器人（scipy）
-pip install -e ".[fluid]"        # 流体仿真（orca-sph）
-
-# 一次安装所有样例依赖
-pip install -e ".[all]"
+python examples/euler/g1_vision_nav/run_green_table_crossing.py \
+  --layout docs/stage2/layouts/green_table.json
 ```
 
-> **注意**：`franka_rl`、`ant_rl`、`legged_gym`、`xbot` 依赖 PyTorch，但各示例 `requirements.txt` 中的 `torch` 均已注释，需根据 NVIDIA 驱动版本手动安装对应的 CUDA 版本。请访问 [PyTorch 官网](https://pytorch.org/get-started/locally/) 选择安装命令，或查看各示例 `requirements.txt` 顶部的已验证配置。
+[观看绿色桌子 Demo 视频](https://wcnlc0kde55u.feishu.cn/wiki/AnIAwm8ogio7sKkDFQZc1b9Cnef#BZtldaMmwo6pnFxQHhbcHvdpnug) · [查看该分支入口代码](https://github.com/Xbotics-Embodied-AI-club/Orcaplayground-G1-routing-inspection/blob/feature/demo1-v1-green-table/examples/euler/g1_vision_nav/run_green_table_crossing.py)
 
-### 运行要求
+运行时观察：头部 RGB 能持续取帧，绿色桌子进入视野后导航发生绕行，机器人最终到达目标附近。默认目标坐标为 `(4.7, 0.0)`，可通过 `--goal-x`、`--goal-y` 调整。
 
-1. **OrcaStudio/OrcaLab**：确保 OrcaStudio/OrcaLab 正在运行（默认地址：`localhost:50051`）
-2. **Python 版本**：Python >= 3.10（见 `setup.py` 的 `python_requires`）
-3. **场景配置**：运行前请先把对应 actor 手动拖入布局；详细说明见上方 [手动拖动资产（运行前必做）](#-手动拖动资产运行前必做)
+该入口默认执行 `4000` 个控制步，不会因到点而立即退出进程；需要提前结束时可按 `Ctrl+C`。
+## Demo 2：工厂电气柜巡检
 
-## 🔧 OrcaLab 配置
+**目标：**沿预设路径点前进，利用 RGB 颜色规则修正运动方向，抵达电气柜附近后取景并保存照片。
 
-### 配置文件位置
-
-OrcaLab 配置文件位于 `.orcalab/config.toml`，OrcaLab 启动时会自动加载工作目录下的此配置文件。
-
-### 已配置的外部程序
-
-完整配置见 [.orcalab/config.toml](.orcalab/config.toml)，当前已配置的程序：
-
-- `run_sim_loop` - 空循环仿真
-- `character` - 角色仿真
-- `legged_train` - 足式机器人训练（SB3 PPO）
-- `legged_rllib_train` - 足式机器人训练（RLlib APPO）
-- `wheeled_chassis` - 轮式底盘仿真（差速驱动）
-- `anker_chassis` - 阿克曼转向底盘仿真
-- `xbot_orca` - XBot 仿真
-- `g1` - G1 人形仿真
-- `zq_sa01` - ZQ SA01 人形仿真
-- `run_actors` - Actor 场景复制
-- `run_lights` - 灯光场景复制
-- `franka_reach_train` - Franka 多机械臂 Reach 任务训练（TQC + HER）
-- `fluid_sim` - 流体仿真
-
-### 添加新程序
-
-如需添加新的外部程序，编辑 `.orcalab/config.toml` 文件，在 `[[external_programs.programs]]` 部分添加新条目。
-
-#### 配置格式
-
-```toml
-[[external_programs.programs]]
-name = "your_program_name"           # ⚠️ 必填：程序唯一标识符
-display_name = "显示名称"             # ⚠️ 必填：在 OrcaLab UI 中显示的名称
-command = "python"                    # ⚠️ 必填：执行命令（通常是 "python"）
-args = ["-m", "examples.your_module.run_script"]  # ⚠️ 必填：命令行参数列表
-description = "程序描述"              # 可选：程序描述信息
-```
-
-#### 参数说明
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `name` | 字符串 | ✅ 是 | **程序唯一标识符**，用于 OrcaLab 内部查找和启动程序。必须与所有已配置程序的 `name` 和 `display_name` 都不重复。建议使用小写字母、数字和下划线，如 `my_program`。 |
-| `display_name` | 字符串 | ✅ 是 | **显示名称**，在 OrcaLab 启动对话框的 UI 中显示给用户。必须与所有已配置程序的 `name` 和 `display_name` 都不重复。可以使用中文、空格等字符，如 `我的程序`。 |
-| `command` | 字符串 | ✅ 是 | **执行命令**，通常是 `"python"`，也可以是其他可执行命令（如 `"python3"`、`"conda"` 等）。 |
-| `args` | 字符串数组 | ✅ 是 | **命令行参数列表**，每个参数作为数组的一个元素。例如：<br>- 模块方式：`["-m", "examples.module.run_script"]`<br>- 脚本方式：`["examples/script.py", "--arg1", "value1"]`<br>- 带参数：`["-m", "examples.module.run", "--config", "config.yaml", "--train"]` |
-| `description` | 字符串 | ❌ 否 | **程序描述**，用于在 OrcaLab UI 的工具提示中显示，帮助用户了解程序功能。 |
-
-#### ⚠️ 重要注意事项
-
-1. **`name` 和 `display_name` 禁止重复**
-   - ❌ **禁止**：两个程序的 `name` 相同
-   - ❌ **禁止**：两个程序的 `display_name` 相同
-   - ❌ **禁止**：一个程序的 `name` 与另一个程序的 `display_name` 相同
-   - ✅ **允许**：同一个程序内部，`name` 和 `display_name` 可以不同（通常建议不同，以便区分）
-
-2. **`name` 的唯一性要求**
-   - `name` 是程序在系统中的唯一标识符，OrcaLab 通过 `name` 来查找和启动程序
-   - 如果 `name` 重复，`get_external_program_config()` 只会返回第一个匹配的程序，导致后续程序无法正确启动
-   - 建议使用有意义的、描述性的名称，如 `legged_train`、`character_sim` 等
-
-3. **`display_name` 的唯一性要求**
-   - `display_name` 在 OrcaLab UI 中显示，如果重复会导致用户无法区分不同的程序
-   - 建议使用清晰、描述性的显示名称，如 `Legged Robot Training`、`Character Simulation` 等
-
-4. **工作目录**
-   - 程序启动时的工作目录是 OrcaLab 的工作目录（通常是 `.orcalab/config.toml` 所在的目录）
-   - 在 `args` 中使用相对路径时，请确保相对于工作目录的路径正确
-
-5. **模块导入路径**
-   - 使用 `-m` 参数以模块方式运行时，确保模块路径正确
-   - 例如：`["-m", "examples.legged_gym.run_legged_rl"]` 表示运行 `examples/legged_gym/run_legged_rl.py`
-
-#### 配置示例
-
-```toml
-# 示例 1：简单模块启动
-[[external_programs.programs]]
-name = "my_simple_program"
-display_name = "简单程序"
-command = "python"
-args = ["-m", "examples.my_module.run_script"]
-description = "这是一个简单的示例程序"
-
-# 示例 2：带命令行参数的程序
-[[external_programs.programs]]
-name = "legged_train"
-display_name = "Legged Robot Training"
-command = "python"
-args = [
-    "-m", 
-    "examples.legged_gym.run_legged_rl",
-    "--config", "examples/legged_gym/configs/sb3_ppo_config.yaml",
-    "--train",
-    "--visualize"
-]
-description = "启动足式机器人强化学习训练"
-
-# 示例 3：使用脚本路径（非模块方式）
-[[external_programs.programs]]
-name = "custom_script"
-display_name = "自定义脚本"
-command = "python"
-args = ["examples/custom/script.py", "--option", "value"]
-description = "直接运行脚本文件"
-```
-
-#### 验证配置
-
-添加新程序后，建议：
-
-1. **检查重复**：确认新程序的 `name` 和 `display_name` 与所有已配置程序都不重复
-2. **测试启动**：在 OrcaLab 中尝试启动新程序，确认命令和参数正确
-3. **查看日志**：如果启动失败，查看 OrcaLab 的日志输出，检查命令、参数或模块路径是否正确
-
-### 初始化配置（可选）
-
-如果当前目录没有 `.orcalab/config.toml`，可以使用 OrcaLab 生成基本配置：
+先停止上一份 Demo，重新打开 OrcaLab 并选择工厂场景及 `factory_navi.json`，检查头部相机，再进入手动启动模式。终端 B 执行：
 
 ```bash
-orcalab --init-config
+cd ~/SY/OrcaPlayground
+conda activate orca
+git switch demo1-v1-factory-navi
+
+python examples/euler/g1_vision_nav/run_factory_navi.py \
+  --layout docs/stage2/layouts/factory_navi.json
 ```
 
-然后手动添加本项目的外部程序配置。
+[观看工厂巡检 Demo 视频](https://wcnlc0kde55u.feishu.cn/wiki/AnIAwm8ogio7sKkDFQZc1b9Cnef#PW9Rdag28oSvskxsIqtc4eMbnZg) · [查看该分支入口代码](https://github.com/Xbotics-Embodied-AI-club/Orcaplayground-G1-routing-inspection/blob/demo1-v1-factory-navi/examples/euler/g1_vision_nav/run_factory_navi.py)
 
-## 📖 更多信息
+默认使用左侧路线。第一视角预览默认提供在仿真程序所在机器的 `http://127.0.0.1:8765`，不会自动打开浏览器；不打开网页不影响导航。加入 `--no-camera-window` 可关闭网页服务，RGB 接收和拍照仍会继续。
 
-- OrcaGym 主仓库：https://github.com/openverse-orca/OrcaGym
-- 各示例详细说明：查看 `examples/*/README.md`
+默认照片路径：
+
+```text
+envs/euler/g1_vision_nav/g1_cabinet_left_rgb.png
+```
+
+![飞书教程中的电气柜取景效果](docs/stage2/images/inspection-result.png)
+
+程序按到点状态和蓝色柜体规则进行取景与拍照，没有接入 YOLO。请以本次日志中的“电气柜照片已保存，巡检完成”和文件修改时间确认结果，不能仅凭目录里存在旧照片判断成功。拍照后机器人切换为站立，进程继续到设定控制步数结束。
+
+
+### 常用参数
+
+| 参数 | 适用 Demo | 说明 |
+| --- | --- | --- |
+| `--addr` | 两者 | gRPC 地址，默认 `127.0.0.1:50051` |
+| `--actor-name` | 两者 | 场景 Actor 名称，默认 `g1` |
+| `--rgb-port` | 两者 | 头部 RGB 端口，默认 `7070` |
+| `--layout` | 两者 | 当前布局文件的提示路径，不负责加载布局 |
+| `--num-steps` | 两者 | 控制步数；绿色桌子默认 `4000`，工厂默认 `8000` |
+| `--output` | 两者 | RGB 样本或巡检照片输出路径 |
+| `--max-speed` | 工厂 | 巡航速度上限；默认 `1.2` m/s，需按实际场景验证，可用 `0.6` 降速复现 |
+| `--no-camera-window` | 工厂 | 关闭网页预览服务 |
+
+完整参数见对应入口的 `--help`。文档中的录屏展示已有运行效果；当前场景、相机设置和代码版本的完成情况仍应以实际运行结果为准。
+
+## 常见问题
+
+| 现象 | 排查方向 |
+| --- | --- |
+| 找不到入口脚本 | 用 `git branch --show-current` 确认分支；两个入口分别位于两个分支 |
+| 场景空白或缺失资产 | 检查资产订阅与同步，确认选择了对应初始场景并打开正确 Layout |
+| 无法连接 `50051` | 确认 OrcaLab 已进入 Runtime；远程运行时设置正确的 `--addr` |
+| 一直等待 RGB | 检查头部相机开关、`IsRecording`、`ColorPort=7070`，查看相机接流日志 |
+| 找不到关节或执行器 | 确认使用 `g1_pick_usda`，Actor 名为 `g1`，不要用第一篇的其他 G1 资产替代 |
+| 机器人动作异常、画面跳动 | 检查是否同时开启了多个仿真推进程序；使用手动启动模式，只保留一个 Demo |
+| RGB 正常但未绕障 | 检查图像是否持续更新、障碍物颜色是否进入视野；颜色规则不能识别所有障碍 |
+| 到柜前但没有新照片 | 查看本次巡检日志、相机画面及文件修改时间；取景未确认时不会报告拍照成功 |
+
+## 继续探索
+
+完成复现后，可以先调整桌子位置、路径点或速度，每次只改变一个因素并观察结果。之后再尝试深度感知、自动路径规划、目标检测。
+
+课程选用 G1，是因为本次资产配置提供相机与可复用运控模型，便于学习完整开发流程，并不代表人形机器人适合所有巡检任务。实际任务仍需依据场景与需求选择机器人和算法。
+
+## 官方资料与致谢
+
+- [第二篇飞书技术文档](https://wcnlc0kde55u.feishu.cn/wiki/AnIAwm8ogio7sKkDFQZc1b9Cnef)
+- [第一篇入门资料（release/26.7.1）](https://github.com/Xbotics-Embodied-AI-club/Orcaplayground-G1-routing-inspection/tree/release/26.7.1)
+- [OrcaPlayground 官方 README](https://github.com/openverse-orca/OrcaPlayground/blob/release/26.7.1/README.md)
+- [OrcaGym](https://github.com/openverse-orca/OrcaGym) · [ORCA 官方文档](https://docs.orca3d.cn/) · [ORCA 资产中心](https://simassets.orca3d.cn/)
+
+本项目基于 OrcaPlayground 和 OrcaGym。感谢上游项目及贡献者，许可证见 [LICENSE](LICENSE)。
